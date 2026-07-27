@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: tds-databot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn bot:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.openai.com/v1
+      - key: LLM_MODEL
+        value: gpt-4o
+      - key: QUESTION_BUDGET_SECONDS
+        value: "210"
+      - key: MAX_AGENT_STEPS
+        value: "12"
