@@ -173,6 +173,11 @@ SYSTEM_PROMPT = """You are a data-analysis agent answering inside a Telegram thr
 - Compute or fetch anything you can rather than guessing - this includes dates,
   times, and any number you could derive. You have no real-time awareness on
   your own, so never state a current date/time from memory.
+- Always print() the value you need from run_python - a function call or bare
+  expression with no print produces no output at all. If a tool call comes back
+  with empty output, that attempt failed silently; fix the code (add prints,
+  try a different source, check for an error) and try again rather than
+  answering from memory as if the fetch had succeeded.
 - If a message is purely setup for a later one, still send a short JSON
   acknowledgement in whatever shape it requests, or {"answer": "ok",
   "log_url": "PLACEHOLDER"} if no shape was given - every message needs a reply.
@@ -213,7 +218,10 @@ def extract_json_object(text: str) -> dict:
                 except json.JSONDecodeError:
                     break
                 if isinstance(parsed, dict):
-                    return parsed if "answer" in parsed else {"answer": parsed}
+                    if "answer" in parsed:
+                        return parsed
+                    parsed.pop("log_url", None)  # avoid a duplicated/stray log_url when re-wrapping
+                    return {"answer": parsed}
                 return {"answer": parsed}
     return {"answer": cleaned}
 
