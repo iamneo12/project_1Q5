@@ -1,26 +1,37 @@
 """
-Data-Analyst Telegram Bot — TDS Project 1, Q5.
+Telegram data-analysis agent.
 
-Architecture (all in one asyncio process):
-  FastAPI app        -> GET /health        keep-alive + sanity check
-                      -> GET /run.jsonl    public run log (wget-able)
-  asyncio task        -> Telegram long-poll loop -> per message: agent loop -> sendMessage(JSON)
-  asyncio task        -> self-ping /health every 10 min (free hosts idle out)
+Design summary
+--------------
+Each incoming message becomes an AgentSession. A session runs the model in a
+loop, letting it call a sandboxed `run_python` tool, until it produces a final
+plain-text answer that gets folded into {"answer": ..., "log_url": ...}.
 
-Why this is more robust than a minimal reference implementation:
-  - run_python executes in a SEPARATE PROCESS with a hard wall-clock timeout and
-    output cap, instead of exec() in-process. One infinite loop from a bad model
-    response can't hang or crash the bot.
-  - A true wall-clock deadline is tracked per question. Once ~85% of the budget
-    is spent, tools are disabled and the model is forced to answer with what it
-    has. A late, perfect answer scores zero — an early, honest guess scores something.
-  - JSON extraction uses a balanced-brace scanner, not a regex, so it survives
-    nested objects/arrays inside "answer".
-  - Every message (not just the last one in a multi-turn thread) gets a reply,
-    because the grader waits for a response after each send.
-  - Every step (tool calls, model replies, errors) is appended to run.jsonl
-    immediately, so the log is useful for debugging failures after the fact.
+Stopping condition for tool use is a hybrid of three layers:
+
+  1. Step cap        - absolute ceiling on number of loop iterations, no
+                        matter what the clock says.
+  2. Phase split      - the total per-question time budget is split into a
+                        "gathering" phase (tools allowed) and a trailing
+                        "compose" phase (tools switched off, model must
+                        answer with what it already has).
+  3. Time bank        - within the gathering phase, each tool call is
+                        compared against a rough per-call estimate. Calls
+                        that finish early deposit the surplus into a bank;
+                        calls that run long withdraw from it. The bank
+                        shifts the gathering/compose boundary itself, so a
+                        run of fast calls buys a bit more room and a slow
+                        call tightens the remaining window.
+
+A model that stops calling tools and returns text is treated as an implicit
+"I'm confident enough" signal - the loop exits the moment that happens,
+independent of the three layers above.
+
+Every step is written to run.jsonl as a structured record (not a single
+flat blob) so the phase/bank arithmetic is inspectable after the fact.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
@@ -29,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -36,97 +48,114 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from openai import AsyncOpenAI
 
-# ---------------------------------------------------------------------------
-# Config (all from env vars — never hardcode secrets)
-# ---------------------------------------------------------------------------
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = os.environ["BASE_URL"].rstrip("/")           # e.g. https://your-service.onrender.com
-LLM_API_KEY = os.environ["LLM_API_KEY"]
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")        # use a frontier-class model, not a mini variant
-QUESTION_BUDGET_SECONDS = float(os.environ.get("QUESTION_BUDGET_SECONDS", "210"))
-MAX_AGENT_STEPS = int(os.environ.get("MAX_AGENT_STEPS", "12"))
-HISTORY_TURNS_PER_CHAT = 20
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class Settings:
+    bot_token = os.environ["BOT_TOKEN"]
+    base_url = os.environ["BASE_URL"].rstrip("/")
+    llm_api_key = os.environ["LLM_API_KEY"]
+    llm_base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
+    llm_model = os.environ.get("LLM_MODEL", "gpt-4o")
+
+    total_budget_s = float(os.environ.get("QUESTION_BUDGET_SECONDS", "210"))
+    max_steps = int(os.environ.get("MAX_AGENT_STEPS", "12"))
+    history_cap = 20
+
+    # hybrid-deadline tuning
+    gather_phase_fraction = 0.65   # share of total_budget_s spent gathering
+    per_call_estimate_s = 25.0     # rough expected cost of one tool call
+    max_call_timeout_s = 60.0
+    min_call_timeout_s = 5.0
+
+    telegram_api = f"https://api.telegram.org/bot{bot_token}"
+
 
 LOG_PATH = Path(__file__).parent / "run.jsonl"
-_log_lock = asyncio.Lock()
-
-llm = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-app = FastAPI()
-
-# per-chat rolling history: {chat_id: [ {"role": ..., "content": ...}, ... ]}
-chat_history: dict[int, list[dict]] = {}
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-async def log_event(event: dict):
-    event["ts"] = time.time()
-    line = json.dumps(event, ensure_ascii=False, default=str)
-    async with _log_lock:
-        with open(LOG_PATH, "a") as f:
-            f.write(line + "\n")
+# =============================================================================
+# Structured logging
+# =============================================================================
+
+class RunLog:
+    """Appends structured JSON records to run.jsonl. Each record carries a
+    `kind` field (model_turn / tool_call / phase_shift / final / error) so a
+    reader can filter the stream instead of parsing one flat shape."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock = asyncio.Lock()
+
+    async def write(self, kind: str, **fields):
+        record = {"kind": kind, "ts": time.time(), **fields}
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        async with self._lock:
+            with open(self._path, "a") as fh:
+                fh.write(line + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Sandboxed code execution tool
-# ---------------------------------------------------------------------------
-RUNNER_PREAMBLE = """
-import pandas as pd, numpy as np, requests, json, re, io
-from bs4 import BeautifulSoup
-"""
+log = RunLog(LOG_PATH)
 
-def _run_subprocess(code: str, timeout: float) -> str:
-    """Execute `code` in a fresh Python process. Returns captured stdout+stderr,
-    truncated. A subprocess means a hang or crash can't take down the bot."""
-    full_code = RUNNER_PREAMBLE + "\n" + code
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-        f.write(full_code)
-        path = f.name
+
+# =============================================================================
+# Sandboxed Python execution
+# =============================================================================
+
+IMPORT_PREAMBLE = (
+    "import pandas as pd, numpy as np, requests, json, re, io\n"
+    "from bs4 import BeautifulSoup\n"
+)
+
+
+def _execute_in_subprocess(code: str, timeout_s: float) -> str:
+    """Run `code` in a throwaway Python process so a hang or crash can only
+    take down that process, never the bot."""
+    script = IMPORT_PREAMBLE + "\n" + code
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
     try:
-        result = subprocess.run(
-            [sys.executable, path],
+        tmp.write(script)
+        tmp.close()
+        completed = subprocess.run(
+            [sys.executable, tmp.name],
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=timeout_s,
         )
-        out = result.stdout
-        if result.returncode != 0:
-            out += "\n[stderr]\n" + result.stderr
+        output = completed.stdout
+        if completed.returncode != 0:
+            output += "\n[stderr]\n" + completed.stderr
     except subprocess.TimeoutExpired:
-        out = f"[error] execution exceeded {timeout:.0f}s and was killed"
-    except Exception as e:
-        out = f"[error] {e!r}"
+        output = f"[killed] exceeded {timeout_s:.0f}s"
+    except Exception as exc:  # noqa: BLE001 - surfaced to the model, not raised
+        output = f"[exception] {exc!r}"
     finally:
         try:
-            os.unlink(path)
+            os.unlink(tmp.name)
         except OSError:
             pass
-    MAX_CHARS = 8000
-    if len(out) > MAX_CHARS:
-        out = out[:MAX_CHARS] + "\n...[truncated]"
-    return out
+
+    cap = 8000
+    if len(output) > cap:
+        output = output[:cap] + "\n...[truncated]"
+    return output
 
 
-async def run_python_tool(code: str, remaining_budget: float) -> str:
-    # never let a single call eat the whole remaining budget
-    timeout = max(5.0, min(60.0, remaining_budget - 5))
+async def run_python_tool(code: str, timeout_s: float) -> str:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _run_subprocess, code, timeout)
+    return await loop.run_in_executor(None, _execute_in_subprocess, code, timeout_s)
 
 
-TOOLS = [
+TOOL_SPECS = [
     {
         "type": "function",
         "function": {
             "name": "run_python",
             "description": (
-                "Execute Python code to fetch, download, parse or compute anything "
-                "needed to answer the question. pandas, numpy, requests, and "
-                "BeautifulSoup are pre-imported. Print whatever you need to see; "
-                "stdout is returned to you."
+                "Run Python to fetch, parse, or compute anything the question "
+                "needs. pandas, numpy, requests, and BeautifulSoup are already "
+                "imported. Print anything you want to see; stdout comes back to you."
             ),
             "parameters": {
                 "type": "object",
@@ -137,146 +166,255 @@ TOOLS = [
     }
 ]
 
-SYSTEM_PROMPT = """You are a data-analysis agent replying inside a Telegram conversation.
+SYSTEM_PROMPT = """You are a data-analysis agent answering inside a Telegram thread.
 
-Rules:
-1. Answer the LATEST user message. Earlier messages in this thread are context for a
-   multi-turn task (e.g. data sent in an earlier message).
-2. Use the run_python tool to fetch or compute anything you can — never guess a number
-   you could calculate. For well-known published statistics where fetching fails, you
-   may answer from your own knowledge, but say so is unnecessary; just answer.
-3. If the message is only setup for a later message (e.g. "I will send you data next"),
-   still reply with a short, reasonable JSON acknowledgement in the exact shape the
-   message (if any) asked for, or {"answer": "ok", "log_url": "PLACEHOLDER"} if no shape
-   was specified — every message must get a reply.
-4. Your FINAL reply must be EXACTLY ONE JSON object and NOTHING else: no markdown code
-   fences, no explanation text before or after. Match the requested key names, nesting,
-   and value types (string vs number vs object) exactly as the message specifies. Do not
-   add extra keys beyond what's asked for plus log_url.
-5. Always include a "log_url" key in your final JSON, set to the literal string
-   "PLACEHOLDER" — the calling code will replace it with the real URL.
+- Respond to the most recent user message. Earlier messages are context only
+  (for example, data supplied ahead of the real question).
+- Compute or fetch anything you can rather than guessing - this includes dates,
+  times, and any number you could derive. You have no real-time awareness on
+  your own, so never state a current date/time from memory.
+- If a message is purely setup for a later one, still send a short JSON
+  acknowledgement in whatever shape it requests, or {"answer": "ok",
+  "log_url": "PLACEHOLDER"} if no shape was given - every message needs a reply.
+- Your final reply must be ONE JSON object and nothing else - no fences, no
+  prose around it. Match the requested keys, nesting, and types exactly, and
+  don't add fields beyond what was asked plus log_url.
+- Always include "log_url": "PLACEHOLDER" in the final object; it gets
+  swapped for the real URL after you respond.
 """
 
 
-def extract_json(text: str) -> dict:
-    """Find the first balanced {...} in text and parse it. Falls back to
-    wrapping raw text as an answer if nothing parses."""
-    text = text.strip()
+def extract_json_object(text: str) -> dict:
+    """Scan for the first balanced {...} span and parse it, tracking brace
+    depth manually so nested arrays/objects inside "answer" don't break it."""
+    cleaned = text.strip()
     for fence in ("```json", "```"):
-        if text.startswith(fence):
-            text = text[len(fence):]
-        if text.endswith("```"):
-            text = text[: -3]
-    text = text.strip()
+        if cleaned.startswith(fence):
+            cleaned = cleaned[len(fence):]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
 
-    start = text.find("{")
-    if start == -1:
-        return {"answer": text}
+    open_at = cleaned.find("{")
+    if open_at == -1:
+        return {"answer": cleaned}
+
     depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
+    for i in range(open_at, len(cleaned)):
+        ch = cleaned[i]
+        if ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
-                candidate = text[start : i + 1]
+                span = cleaned[open_at : i + 1]
                 try:
-                    parsed = json.loads(candidate)
-                    if isinstance(parsed, dict):
-                        if "answer" not in parsed:
-                            return {"answer": parsed}
-                        return parsed
+                    parsed = json.loads(span)
                 except json.JSONDecodeError:
                     break
-    return {"answer": text}
+                if isinstance(parsed, dict):
+                    return parsed if "answer" in parsed else {"answer": parsed}
+                return {"answer": parsed}
+    return {"answer": cleaned}
 
 
-# ---------------------------------------------------------------------------
-# Agent loop
-# ---------------------------------------------------------------------------
-async def run_agent(chat_id: int, user_text: str) -> dict:
-    deadline = time.monotonic() + QUESTION_BUDGET_SECONDS
-    history = chat_history.setdefault(chat_id, [])
-    history.append({"role": "user", "content": user_text})
-    history[:] = history[-HISTORY_TURNS_PER_CHAT:]
+# =============================================================================
+# Hybrid deadline tracker
+# =============================================================================
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-    final_json = None
+@dataclass
+class DeadlineTracker:
+    """Owns the step cap / phase split / time bank logic for one question."""
 
-    for step in range(MAX_AGENT_STEPS):
-        remaining = deadline - time.monotonic()
-        force_answer = remaining < QUESTION_BUDGET_SECONDS * 0.15  # ~15% left: stop tooling
+    total_budget_s: float
+    gather_fraction: float
+    max_steps: int
+    per_call_estimate_s: float
 
-        try:
-            resp = await asyncio.wait_for(
-                llm.chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=messages,
-                    tools=None if force_answer else TOOLS,
-                    tool_choice="auto" if not force_answer else "none",
-                ),
-                timeout=max(5.0, remaining),
-            )
-        except Exception as e:
-            await log_event({"chat_id": chat_id, "step": step, "error": f"llm_call_failed: {e!r}"})
-            final_json = {"answer": "internal error"}
-            break
+    started_at: float = field(default_factory=time.monotonic)
+    steps_taken: int = 0
+    bank_s: float = 0.0
 
-        choice = resp.choices[0].message
-        await log_event(
-            {
-                "chat_id": chat_id,
-                "step": step,
-                "role": "assistant",
-                "content": choice.content,
-                "tool_calls": [tc.function.name for tc in (choice.tool_calls or [])],
-            }
+    @property
+    def elapsed_s(self) -> float:
+        return time.monotonic() - self.started_at
+
+    @property
+    def gather_deadline_s(self) -> float:
+        """Boundary (in elapsed seconds) past which tools switch off, shifted
+        by whatever the time bank currently holds."""
+        base = self.total_budget_s * self.gather_fraction
+        return base + self.bank_s
+
+    def in_gathering_phase(self) -> bool:
+        if self.steps_taken >= self.max_steps:
+            return False
+        return self.elapsed_s < self.gather_deadline_s
+
+    def call_timeout(self) -> float:
+        remaining_total = max(0.0, self.total_budget_s - self.elapsed_s)
+        return max(5.0, min(60.0, remaining_total - 5))
+
+    def record_call(self, actual_s: float):
+        self.steps_taken += 1
+        surplus = self.per_call_estimate_s - actual_s
+        self.bank_s += surplus  # can go negative on slow calls
+
+    def snapshot(self) -> dict:
+        return {
+            "elapsed_s": round(self.elapsed_s, 2),
+            "steps_taken": self.steps_taken,
+            "bank_s": round(self.bank_s, 2),
+            "gather_deadline_s": round(self.gather_deadline_s, 2),
+        }
+
+
+# =============================================================================
+# Agent session
+# =============================================================================
+
+class AgentSession:
+    """One run of the agent loop for a single incoming message."""
+
+    def __init__(self, chat_id: int, history: list[dict], client: AsyncOpenAI, settings: Settings):
+        self.chat_id = chat_id
+        self.history = history
+        self.client = client
+        self.settings = settings
+        self.deadline = DeadlineTracker(
+            total_budget_s=settings.total_budget_s,
+            gather_fraction=settings.gather_phase_fraction,
+            max_steps=settings.max_steps,
+            per_call_estimate_s=settings.per_call_estimate_s,
         )
 
-        if choice.tool_calls:
-            messages.append(choice.model_dump(exclude_unset=True))
-            for tc in choice.tool_calls:
-                args = json.loads(tc.function.arguments or "{}")
-                code = args.get("code", "")
-                remaining = deadline - time.monotonic()
-                output = await run_python_tool(code, remaining)
-                await log_event({"chat_id": chat_id, "step": step, "tool": "run_python", "code": code, "output": output})
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-            continue
+    async def run(self) -> dict:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history
 
-        # plain-text final answer
-        final_json = extract_json(choice.content or "")
-        history.append({"role": "assistant", "content": choice.content or ""})
-        break
+        for _ in range(self.settings.max_steps):
+            gathering = self.deadline.in_gathering_phase()
 
-    if final_json is None:
-        final_json = {"answer": "internal error"}
+            await log.write(
+                "phase_shift" if not gathering else "phase_ok",
+                chat_id=self.chat_id,
+                gathering=gathering,
+                **self.deadline.snapshot(),
+            )
 
-    final_json["log_url"] = f"{BASE_URL}/run.jsonl"
-    await log_event({"chat_id": chat_id, "final": final_json})
-    return final_json
+            reply = await self._call_model(messages, tools_enabled=gathering)
+            if reply is None:
+                return self._wrap_answer({"answer": "internal error"})
+
+            if reply.tool_calls:
+                messages.append(reply.model_dump(exclude_unset=True))
+                await self._run_tool_calls(reply.tool_calls, messages)
+                continue
+
+            # model returned plain text -> implicit "confident enough" exit
+            self.history.append({"role": "assistant", "content": reply.content or ""})
+            return self._wrap_answer(extract_json_object(reply.content or ""))
+
+        return self._wrap_answer({"answer": "internal error"})
+
+    async def _call_model(self, messages: list[dict], tools_enabled: bool):
+        remaining = max(1.0, self.settings.total_budget_s - self.deadline.elapsed_s)
+        try:
+            resp = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model=self.settings.llm_model,
+                    messages=messages,
+                    tools=TOOL_SPECS if tools_enabled else None,
+                    tool_choice="auto" if tools_enabled else "none",
+                ),
+                timeout=remaining,
+            )
+        except Exception as exc:  # noqa: BLE001
+            await log.write("error", chat_id=self.chat_id, where="llm_call", error=repr(exc))
+            return None
+
+        message = resp.choices[0].message
+        await log.write(
+            "model_turn",
+            chat_id=self.chat_id,
+            content=message.content,
+            tool_calls=[tc.function.name for tc in (message.tool_calls or [])],
+        )
+        return message
+
+    async def _run_tool_calls(self, tool_calls, messages: list[dict]):
+        for call in tool_calls:
+            args = json.loads(call.function.arguments or "{}")
+            code = args.get("code", "")
+
+            timeout_s = self.deadline.call_timeout()
+            call_started = time.monotonic()
+            output = await run_python_tool(code, timeout_s)
+            actual_s = time.monotonic() - call_started
+
+            self.deadline.record_call(actual_s)
+            await log.write(
+                "tool_call",
+                chat_id=self.chat_id,
+                code=code,
+                output=output,
+                actual_s=round(actual_s, 2),
+                **self.deadline.snapshot(),
+            )
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+
+    def _wrap_answer(self, payload: dict) -> dict:
+        payload["log_url"] = f"{self.settings.base_url}/run.jsonl"
+        return payload
 
 
-# ---------------------------------------------------------------------------
-# Telegram polling loop
-# ---------------------------------------------------------------------------
-async def send_message(client: httpx.AsyncClient, chat_id: int, text: str):
-    await client.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+# =============================================================================
+# Chat state + top-level entry point
+# =============================================================================
+
+chat_histories: dict[int, list[dict]] = {}
+settings = Settings()
+llm_client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
+
+
+async def answer_message(chat_id: int, user_text: str) -> dict:
+    history = chat_histories.setdefault(chat_id, [])
+    history.append({"role": "user", "content": user_text})
+    history[:] = history[-settings.history_cap:]
+
+    session = AgentSession(chat_id, history, llm_client, settings)
+    result = await session.run()
+
+    await log.write("final", chat_id=chat_id, result=result)
+    return result
+
+
+# =============================================================================
+# Telegram transport
+# =============================================================================
+
+async def send_telegram_message(client: httpx.AsyncClient, chat_id: int, text: str):
+    await client.post(
+        f"{settings.telegram_api}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+    )
 
 
 async def handle_update(client: httpx.AsyncClient, update: dict):
-    msg = update.get("message")
-    if not msg or "text" not in msg:
+    message = update.get("message")
+    if not message or "text" not in message:
         return
-    chat_id = msg["chat"]["id"]
-    text = msg["text"]
+
+    chat_id = message["chat"]["id"]
+    text = message["text"]
+
     try:
-        result = await run_agent(chat_id, text)
-        reply = json.dumps(result, ensure_ascii=False)
-    except Exception as e:
-        await log_event({"chat_id": chat_id, "error": f"handler_crashed: {e!r}"})
-        reply = json.dumps({"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"})
-    await send_message(client, chat_id, reply)
+        result = await answer_message(chat_id, text)
+        reply_text = json.dumps(result, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001
+        await log.write("error", chat_id=chat_id, where="handle_update", error=repr(exc))
+        reply_text = json.dumps({"answer": "internal error", "log_url": f"{settings.base_url}/run.jsonl"})
+
+    await send_telegram_message(client, chat_id, reply_text)
 
 
 async def telegram_poll_loop():
@@ -285,16 +423,14 @@ async def telegram_poll_loop():
         while True:
             try:
                 resp = await client.get(
-                    f"{TG_API}/getUpdates",
+                    f"{settings.telegram_api}/getUpdates",
                     params={"offset": offset, "timeout": 30},
                 )
-                data = resp.json()
-                for update in data.get("result", []):
+                for update in resp.json().get("result", []):
                     offset = update["update_id"] + 1
-                    # fire-and-forget so slow questions don't block new incoming messages
                     asyncio.create_task(handle_update(client, update))
-            except Exception as e:
-                await log_event({"error": f"poll_loop_error: {e!r}"})
+            except Exception as exc:  # noqa: BLE001
+                await log.write("error", where="poll_loop", error=repr(exc))
                 await asyncio.sleep(3)
 
 
@@ -303,16 +439,20 @@ async def self_ping_loop():
         while True:
             await asyncio.sleep(600)
             try:
-                await client.get(f"{BASE_URL}/health")
+                await client.get(f"{settings.base_url}/health")
             except Exception:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# FastAPI routes
-# ---------------------------------------------------------------------------
+# =============================================================================
+# FastAPI app
+# =============================================================================
+
+app = FastAPI()
+
+
 @app.on_event("startup")
-async def startup():
+async def on_startup():
     LOG_PATH.touch(exist_ok=True)
     asyncio.create_task(telegram_poll_loop())
     asyncio.create_task(self_ping_loop())
@@ -320,7 +460,7 @@ async def startup():
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"ok": True, "model": LLM_MODEL})
+    return JSONResponse({"ok": True, "model": settings.llm_model})
 
 
 @app.get("/run.jsonl")

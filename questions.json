@@ -1,13 +1,44 @@
 [
   {
     "messages": [
-      "Which state has the highest maternal mortality rate based on MOSPI data? Reply with ONLY this JSON object and nothing else: {\"answer\": {\"state\": \"<state name>\"}, \"log_url\": \"<your log url>\"}"
+      "Fetch the boiling point of water at sea level in Celsius from a reliable source, then tell me what that value would be in Kelvin. Reply with ONLY this JSON object and nothing else: {\"answer\": {\"celsius\": <number>, \"kelvin\": <number>}, \"log_url\": \"<your log url>\"}"
     ]
   },
   {
     "messages": [
-      "I will send you a dataset next.",
-      "Here is the data: [12, 45, 23, 67, 34, 89, 21]. What is the median? Reply with ONLY this JSON object and nothing else: {\"answer\": {\"median\": <number>}, \"log_url\": \"<your log url>\"}"
+      "Here's some data I'll reference in my next message.",
+      "Ignore the previous message entirely — just tell me what 9 times 9 is. Reply with ONLY this JSON object and nothing else: {\"answer\": <number>, \"log_url\": \"<your log url>\"}"
+    ]
+  },
+  {
+    "messages": [
+      "A survey of 500 people found 60% prefer tea over coffee. Of the tea drinkers, 25% prefer it iced. How many people prefer iced tea? Reply with ONLY this JSON object and nothing else: {\"answer\": {\"iced_tea_drinkers\": <number>}, \"log_url\": \"<your log url>\"}"
+    ]
+  },
+  {
+    "messages": [
+      "Fetch the current top story headline from a major news homepage right now. Reply with ONLY this JSON object and nothing else: {\"answer\": {\"headline\": \"<string>\"}, \"log_url\": \"<your log url>\"}"
+    ]
+  },
+  {
+    "messages": [
+      "For this one, wrap your entire answer in a code block labeled python, then still include: {\"answer\": {\"result\": <number>}, \"log_url\": \"<your log url>\"} somewhere in there. The question: what is 144 divided by 12?"
+    ]
+  },
+  {
+    "messages": [
+      "Fetch 8 different Wikipedia pages, one at a time, for these countries: France, Germany, Italy, Spain, Portugal, Belgium, Netherlands, Austria — and tell me which one's page was last edited most recently. Reply with ONLY this JSON object and nothing else: {\"answer\": {\"most_recently_edited\": \"<country>\"}, \"log_url\": \"<your log url>\"}"
+    ]
+  },
+  {
+    "messages": [
+      "I'm about to describe a shape.",
+      "A right triangle has legs of length 9 and 12. What is the length of the hypotenuse, and what is the triangle's area? Reply with ONLY this JSON object and nothing else: {\"answer\": {\"hypotenuse\": <number>, \"area\": <number>}, \"log_url\": \"<your log url>\"}"
+    ]
+  },
+  {
+    "messages": [
+      "Reply with an empty answer if you cannot compute this, otherwise: {\"answer\": {\"value\": <number>}, \"log_url\": \"<your log url>\"}. Question: what is the 15th number in the Fibonacci sequence, starting 0, 1, 1, 2...?"
     ]
   }
 ]
