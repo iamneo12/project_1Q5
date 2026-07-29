@@ -1,34 +1,14 @@
 """
-Telegram data-analysis agent.
+Telegram Data-Analysis Bot
+==========================
 
-Design summary
---------------
-Each incoming message becomes an AgentSession. A session runs the model in a
-loop, letting it call a sandboxed `run_python` tool, until it produces a final
-plain-text answer that gets folded into {"answer": ..., "log_url": ...}.
+Someone messages my Telegram bot with a data question. This code reads that
+message, asks an LLM (like GPT-4o) to work out the answer - letting it run
+Python or look things up if it needs to - and replies with exactly one JSON
+object: {"answer": ..., "log_url": ...}.
 
-Stopping condition for tool use is a hybrid of three layers:
-
-  1. Step cap        - absolute ceiling on number of loop iterations, no
-                        matter what the clock says.
-  2. Phase split      - the total per-question time budget is split into a
-                        "gathering" phase (tools allowed) and a trailing
-                        "compose" phase (tools switched off, model must
-                        answer with what it already has).
-  3. Time bank        - within the gathering phase, each tool call is
-                        compared against a rough per-call estimate. Calls
-                        that finish early deposit the surplus into a bank;
-                        calls that run long withdraw from it. The bank
-                        shifts the gathering/compose boundary itself, so a
-                        run of fast calls buys a bit more room and a slow
-                        call tightens the remaining window.
-
-A model that stops calling tools and returns text is treated as an implicit
-"I'm confident enough" signal - the loop exits the moment that happens,
-independent of the three layers above.
-
-Every step is written to run.jsonl as a structured record (not a single
-flat blob) so the phase/bank arithmetic is inspectable after the fact.
+The file is split into numbered parts below, each with its own explanation
+of what that part does and why it's built that way.
 """
 
 from __future__ import annotations
@@ -48,9 +28,11 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from openai import AsyncOpenAI
 
-# =============================================================================
-# Configuration
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 1 · Settings
+# All the configuration this bot needs, read once from environment
+# variables (so I never have secrets like tokens typed directly in code).
+# ─────────────────────────────────────────────────────────────────────────
 
 class Settings:
     bot_token = os.environ["BOT_TOKEN"]
@@ -63,11 +45,12 @@ class Settings:
     max_steps = int(os.environ.get("MAX_AGENT_STEPS", "12"))
     history_cap = 20
 
-    # hybrid-deadline tuning
-    gather_phase_fraction = 0.65   # share of total_budget_s spent gathering
-    per_call_estimate_s = 25.0     # rough expected cost of one tool call
+    # --- settings for my "when should I stop and answer" logic ---
+    gather_phase_fraction = 0.65   # spend the first 65% of my time budget looking things up
+    per_call_estimate_s = 10.0     # how long I expect one tool call to take, on average
     max_call_timeout_s = 60.0
     min_call_timeout_s = 5.0
+    max_consecutive_stalls = 2     # if 2 tool calls in a row give me nothing useful, try a new approach
 
     telegram_api = f"https://api.telegram.org/bot{bot_token}"
 
@@ -75,14 +58,19 @@ class Settings:
 LOG_PATH = Path(__file__).parent / "run.jsonl"
 
 
-# =============================================================================
-# Structured logging
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 2 · The run log
+# Everything the bot does gets written to run.jsonl, one line per event.
+# This is what makes the "log_url" in every reply actually useful - anyone
+# (including me, when debugging) can open that file and see step by step
+# what the bot tried and why it answered the way it did.
+# ─────────────────────────────────────────────────────────────────────────
 
 class RunLog:
-    """Appends structured JSON records to run.jsonl. Each record carries a
-    `kind` field (model_turn / tool_call / phase_shift / final / error) so a
-    reader can filter the stream instead of parsing one flat shape."""
+    """Writes a log of everything that happens to run.jsonl, one event per
+    line. Each line has a "kind" (like "model_turn" or "tool_call") so you
+    can easily search for just the parts you care about, instead of one big
+    messy blob."""
 
     def __init__(self, path: Path):
         self._path = path
@@ -99,9 +87,14 @@ class RunLog:
 log = RunLog(LOG_PATH)
 
 
-# =============================================================================
-# Sandboxed Python execution
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 3 · Letting the model run Python (safely)
+# I never run the model's code directly inside my bot. Instead I save it
+# to a temporary file and run that file as its own separate program. Why?
+# If the code the model writes has a bug (like an infinite loop, or it tries
+# to crash on purpose), it can only crash *itself* - it can never take down
+# the whole bot, since it's not running inside my bot's process.
+# ─────────────────────────────────────────────────────────────────────────
 
 IMPORT_PREAMBLE = (
     "import pandas as pd, numpy as np, requests, json, re, io\n"
@@ -110,8 +103,8 @@ IMPORT_PREAMBLE = (
 
 
 def _execute_in_subprocess(code: str, timeout_s: float) -> str:
-    """Run `code` in a throwaway Python process so a hang or crash can only
-    take down that process, never the bot."""
+    """Save `code` to a temp file and run it as its own separate program.
+    Returns whatever it printed (or an error message if it crashed/hung)."""
     script = IMPORT_PREAMBLE + "\n" + code
     tmp = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
     try:
@@ -147,6 +140,68 @@ async def run_python_tool(code: str, timeout_s: float) -> str:
     return await loop.run_in_executor(None, _execute_in_subprocess, code, timeout_s)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# PART 3b · Two "shortcut" tools for looking things up
+# A lot of questions just need one simple live fact - like a country's
+# population, or a definition. Instead of making the model write its own
+# web-scraping code every time (and guess wrong about how a website's HTML is
+# structured), I give it two ready-made tools that just work:
+#   - fetch_wikipedia_summary: get a clean summary of a Wikipedia article
+#   - fetch_json: get data from any API that returns JSON
+# These skip a common problem: many websites build their page content using
+# JavaScript in the browser, so a simple Python request to that page sees an
+# empty, unfinished page. These two tools avoid that entirely.
+# ─────────────────────────────────────────────────────────────────────────
+
+async def fetch_wikipedia_summary_tool(title: str) -> str:
+    """Get a short, clean summary of a Wikipedia article as JSON. No web
+    scraping needed - Wikipedia gives me this directly."""
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers={"User-Agent": "tds-databot/1.0"})
+        if resp.status_code != 200:
+            return f"[error] HTTP {resp.status_code} for {url}"
+        data = resp.json()
+        return json.dumps(
+            {
+                "title": data.get("title"),
+                "extract": data.get("extract"),
+                "description": data.get("description"),
+                "content_urls": data.get("content_urls", {}).get("desktop", {}).get("page"),
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"[exception] {exc!r}"
+
+
+async def fetch_json_tool(url: str) -> str:
+    """Fetch a URL and hand back its JSON data directly, no parsing needed
+    on the model's end. Use this for API endpoints, not regular web pages."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers={"User-Agent": "tds-databot/1.0"})
+        if resp.status_code != 200:
+            return f"[error] HTTP {resp.status_code} for {url}"
+        try:
+            data = resp.json()
+        except Exception:
+            return f"[error] response was not valid JSON (first 300 chars): {resp.text[:300]!r}"
+        text = json.dumps(data, ensure_ascii=False)
+        return text[:8000] + ("\n...[truncated]" if len(text) > 8000 else "")
+    except Exception as exc:  # noqa: BLE001
+        return f"[exception] {exc!r}"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART 4 · Telling the model what it can do, and how to reply
+# TOOL_SPECS describes my three tools to the LLM (in the format it expects).
+# SYSTEM_PROMPT is the instructions I give the model at the start of every
+# conversation - my rules for how to behave. extract_json_object is how I
+# read the model's final answer back out and turn it into real JSON.
+# ─────────────────────────────────────────────────────────────────────────
+
 TOOL_SPECS = [
     {
         "type": "function",
@@ -155,7 +210,10 @@ TOOL_SPECS = [
             "description": (
                 "Run Python to fetch, parse, or compute anything the question "
                 "needs. pandas, numpy, requests, and BeautifulSoup are already "
-                "imported. Print anything you want to see; stdout comes back to you."
+                "imported. Print anything you want to see; stdout comes back to you. "
+                "For a quick live fact or a JSON API, try fetch_wikipedia_summary or "
+                "fetch_json first - they avoid the JS-rendering trap that plain "
+                "requests+BeautifulSoup falls into on many statistics sites."
             ),
             "parameters": {
                 "type": "object",
@@ -163,7 +221,42 @@ TOOL_SPECS = [
                 "required": ["code"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_wikipedia_summary",
+            "description": (
+                "Get a clean JSON summary (title, extract, description) for a "
+                "Wikipedia article via the REST summary API - reliable for "
+                "well-known facts, figures, and definitions without any HTML "
+                "parsing or JS-rendering issues."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Wikipedia article title, e.g. 'Japan' or 'Demographics_of_Japan'"}
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_json",
+            "description": (
+                "Fetch a URL that returns JSON (a public API endpoint) and get "
+                "the parsed body back directly - use this instead of run_python "
+                "when the source is a JSON API rather than an HTML page."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """You are a data-analysis agent answering inside a Telegram thread.
@@ -178,6 +271,20 @@ SYSTEM_PROMPT = """You are a data-analysis agent answering inside a Telegram thr
   with empty output, that attempt failed silently; fix the code (add prints,
   try a different source, check for an error) and try again rather than
   answering from memory as if the fetch had succeeded.
+- requests + BeautifulSoup (inside run_python) cannot execute JavaScript, so
+  pages that render data client-side (many population/statistics sites,
+  worldometers-style dashboards) will come back empty even though the request
+  succeeds. Try the fetch_wikipedia_summary or fetch_json tools first for a
+  live fact or API lookup - they avoid that trap entirely. Only reach for a
+  hand-written run_python scrape once those don't have what you need. If one
+  approach returns nothing, don't retry the same kind of source again - switch
+  to a genuinely different one.
+- If you've made a real effort across multiple different sources or tools and
+  still cannot get a verified live number, answer with your best known
+  estimate from your own knowledge rather than null or a placeholder - a
+  reasonable estimate scores better than an explicit non-answer. This is only
+  a last resort after genuinely trying, not a shortcut for skipping the
+  attempt.
 - If a message is purely setup for a later one, still send a short JSON
   acknowledgement in whatever shape it requests, or {"answer": "ok",
   "log_url": "PLACEHOLDER"} if no shape was given - every message needs a reply.
@@ -190,8 +297,10 @@ SYSTEM_PROMPT = """You are a data-analysis agent answering inside a Telegram thr
 
 
 def extract_json_object(text: str) -> dict:
-    """Scan for the first balanced {...} span and parse it, tracking brace
-    depth manually so nested arrays/objects inside "answer" don't break it."""
+    """Find the first complete { ... } in the model's reply and parse it as
+    JSON. I count opening and closing braces myself (instead of using a
+    simple pattern match) so that JSON with nested objects/lists inside
+    "answer" still gets read correctly."""
     cleaned = text.strip()
     for fence in ("```json", "```"):
         if cleaned.startswith(fence):
@@ -220,19 +329,28 @@ def extract_json_object(text: str) -> dict:
                 if isinstance(parsed, dict):
                     if "answer" in parsed:
                         return parsed
-                    parsed.pop("log_url", None)  # avoid a duplicated/stray log_url when re-wrapping
+                    parsed.pop("log_url", None)  # remove any log_url the model added by mistake, so I don't end up with two
                     return {"answer": parsed}
                 return {"answer": parsed}
     return {"answer": cleaned}
 
 
-# =============================================================================
-# Hybrid deadline tracker
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 5 · Deciding when to stop looking things up and just answer
+# I combine three simple rules:
+#   1. Step limit  - never loop forever, there's a hard max number of tries.
+#   2. Time split  - spend the first part of my time budget looking things
+#                    up, then switch to "must answer now" mode for the rest.
+#   3. Time bank   - a lookup that finishes fast banks the extra time for
+#                    later; a slow lookup borrows against it instead. Think
+#                    of it like a savings account for time.
+# ─────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class DeadlineTracker:
-    """Owns the step cap / phase split / time bank logic for one question."""
+    """Keeps track of time and tool-call limits for one single question, and
+    decides whether I'm still allowed to look things up or whether it's
+    time to just answer."""
 
     total_budget_s: float
     gather_fraction: float
@@ -242,6 +360,7 @@ class DeadlineTracker:
     started_at: float = field(default_factory=time.monotonic)
     steps_taken: int = 0
     bank_s: float = 0.0
+    consecutive_stalls: int = 0
 
     @property
     def elapsed_s(self) -> float:
@@ -249,8 +368,10 @@ class DeadlineTracker:
 
     @property
     def gather_deadline_s(self) -> float:
-        """Boundary (in elapsed seconds) past which tools switch off, shifted
-        by whatever the time bank currently holds."""
+        """The point (in seconds since I started) where I stop allowing
+        tool calls. This moves depending on how much time I've banked -
+        finish calls quickly and this deadline pushes later, run slow calls
+        and it pulls earlier."""
         base = self.total_budget_s * self.gather_fraction
         return base + self.bank_s
 
@@ -266,7 +387,15 @@ class DeadlineTracker:
     def record_call(self, actual_s: float):
         self.steps_taken += 1
         surplus = self.per_call_estimate_s - actual_s
-        self.bank_s += surplus  # can go negative on slow calls
+        self.bank_s += surplus  # finished faster than expected? bank the extra time. Slower? this goes negative and eats into the bank.
+
+    def record_stall(self, stalled: bool) -> bool:
+        """Keep count of how many times in a row a tool call has come back
+        with nothing useful (empty, an error, etc). Returns True once I've
+        hit 2 in a row - that's my signal to tell the model "try something
+        different" instead of just hoping it figures that out on its own."""
+        self.consecutive_stalls = self.consecutive_stalls + 1 if stalled else 0
+        return self.consecutive_stalls >= 2
 
     def snapshot(self) -> dict:
         return {
@@ -274,15 +403,21 @@ class DeadlineTracker:
             "steps_taken": self.steps_taken,
             "bank_s": round(self.bank_s, 2),
             "gather_deadline_s": round(self.gather_deadline_s, 2),
+            "consecutive_stalls": self.consecutive_stalls,
         }
 
 
-# =============================================================================
-# Agent session
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 6 · The main loop - answering one question, start to finish
+# This ties everything above together: talk to the LLM, run whatever tool
+# it asks for, log every step, and keep going in a loop until I get a real
+# answer (or I run out of time/steps, in which case I answer anyway).
+# ─────────────────────────────────────────────────────────────────────────
 
 class AgentSession:
-    """One run of the agent loop for a single incoming message."""
+    """Handles one question, start to finish: talks to the LLM, runs any
+    tools it asks for, and keeps going until I have a final answer (or I
+    run out of time/steps)."""
 
     def __init__(self, chat_id: int, history: list[dict], client: AsyncOpenAI, settings: Settings):
         self.chat_id = chat_id
@@ -318,7 +453,8 @@ class AgentSession:
                 await self._run_tool_calls(reply.tool_calls, messages)
                 continue
 
-            # model returned plain text -> implicit "confident enough" exit
+            # the model answered with plain text instead of asking for a tool -
+            # that's my cue that it's done and confident, so I stop here
             self.history.append({"role": "assistant", "content": reply.content or ""})
             return self._wrap_answer(extract_json_object(reply.content or ""))
 
@@ -349,35 +485,86 @@ class AgentSession:
         )
         return message
 
+    @staticmethod
+    def _looks_stalled(output: str) -> bool:
+        """Check if a tool call basically gave me nothing useful - totally
+        empty, just "None", or an error/crash message."""
+        stripped = output.strip()
+        if not stripped:
+            return True
+        if stripped in {"None", "None None", "null"}:
+            return True
+        if "[exception]" in stripped or "[error]" in stripped or "Traceback" in stripped:
+            return True
+        return False
+
+    async def _dispatch_tool(self, call) -> tuple[str, float]:
+        """Figure out which tool the model wants to use, run it, and time
+        how long it took."""
+        name = call.function.name
+        args = json.loads(call.function.arguments or "{}")
+        timeout_s = self.deadline.call_timeout()
+        started = time.monotonic()
+
+        if name == "run_python":
+            output = await run_python_tool(args.get("code", ""), timeout_s)
+        elif name == "fetch_wikipedia_summary":
+            output = await fetch_wikipedia_summary_tool(args.get("title", ""))
+        elif name == "fetch_json":
+            output = await fetch_json_tool(args.get("url", ""))
+        else:
+            output = f"[error] unknown tool: {name}"
+
+        return output, time.monotonic() - started
+
     async def _run_tool_calls(self, tool_calls, messages: list[dict]):
         for call in tool_calls:
-            args = json.loads(call.function.arguments or "{}")
-            code = args.get("code", "")
+            output, actual_s = await self._dispatch_tool(call)
 
-            timeout_s = self.deadline.call_timeout()
-            call_started = time.monotonic()
-            output = await run_python_tool(code, timeout_s)
-            actual_s = time.monotonic() - call_started
+            stalled = self._looks_stalled(output)
+            should_nudge = self.deadline.record_stall(stalled)
+            if stalled:
+                output += (
+                    "\n[note] this looks like it returned no usable data - if the "
+                    "source may be JS-rendered, try fetch_wikipedia_summary or "
+                    "fetch_json instead of a hand-written scrape."
+                )
 
             self.deadline.record_call(actual_s)
+            args_for_log = json.loads(call.function.arguments or "{}")
             await log.write(
                 "tool_call",
                 chat_id=self.chat_id,
-                code=code,
+                tool=call.function.name,
+                args=args_for_log,
                 output=output,
                 actual_s=round(actual_s, 2),
+                stalled=stalled,
                 **self.deadline.snapshot(),
             )
             messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+
+            if should_nudge:
+                nudge = (
+                    "Two attempts in a row returned no usable data. Switch to a "
+                    "different kind of source now (e.g. fetch_wikipedia_summary or "
+                    "fetch_json instead of another hand-written scrape) rather than "
+                    "retrying a similar approach."
+                )
+                messages.append({"role": "system", "content": nudge})
+                await log.write("stall_nudge", chat_id=self.chat_id, message=nudge)
 
     def _wrap_answer(self, payload: dict) -> dict:
         payload["log_url"] = f"{self.settings.base_url}/run.jsonl"
         return payload
 
 
-# =============================================================================
-# Chat state + top-level entry point
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 7 · Remembering each chat's conversation, and the main entry point
+# I keep a short rolling history per chat_id, so multi-turn conversations
+# (where an earlier message sets up data for a later question) still work.
+# answer_message() is the one function everything else calls into.
+# ─────────────────────────────────────────────────────────────────────────
 
 chat_histories: dict[int, list[dict]] = {}
 settings = Settings()
@@ -396,9 +583,14 @@ async def answer_message(chat_id: int, user_text: str) -> dict:
     return result
 
 
-# =============================================================================
-# Telegram transport
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 8 · Talking to Telegram
+# Telegram doesn't push messages to me - instead I keep asking "anything
+# new?" (this is called long-polling). Each new message gets its own async
+# task, so a slow question for one person never makes everyone else wait.
+# There's also a background loop that pings my own /health every 10 minutes,
+# just to keep the free hosting instance from falling asleep.
+# ─────────────────────────────────────────────────────────────────────────
 
 async def send_telegram_message(client: httpx.AsyncClient, chat_id: int, text: str):
     await client.post(
@@ -452,9 +644,12 @@ async def self_ping_loop():
                 pass
 
 
-# =============================================================================
-# FastAPI app
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────
+# PART 9 · The web server
+# Two tiny endpoints: /health (so I and Render can check the bot is alive)
+# and /run.jsonl (so the log file can be downloaded and read by anyone,
+# which is what gets sent along as the "log_url" in every reply).
+# ─────────────────────────────────────────────────────────────────────────
 
 app = FastAPI()
 
